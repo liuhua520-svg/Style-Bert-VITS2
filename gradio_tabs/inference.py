@@ -1,5 +1,6 @@
 import datetime
 import json
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,7 @@ from style_bert_vits2.constants import (
     Languages,
 )
 from style_bert_vits2.logging import logger
+from style_bert_vits2.models.infer import write_lab_file
 from style_bert_vits2.nlp import InvalidToneError
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker as pyopenjtalk
 from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone, kata_tone2phone_tone
@@ -262,6 +264,7 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
         intonation_scale,
         null_models: dict[int, NullModelParam],
         force_reload_model: bool,
+        output_lab: bool,
     ):
         model_holder.get_model(model_name, model_path)
         assert model_holder.current_model is not None
@@ -300,8 +303,22 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
 
         start_time = datetime.datetime.now()
 
+        # LAB出力は音素アラインメントを参照音声の adjust_voice() 前の状態から
+        # 計算するため、ピッチ・抑揚を変更していると時刻がズレてしまう。
+        # infer() 内部でも ValueError になるが、Gradio 上では分かりやすい
+        # 日本語メッセージとして先に弾く。
+        if output_lab and not (pitch_scale == 1.0 and intonation_scale == 1.0):
+            return (
+                "Error: LABファイル出力は音高・抑揚を1.0から変更している場合には対応していません。"
+                "音高・抑揚を1.0に戻すか、LAB出力のチェックを外してください。",
+                None,
+                kata_tone_json_str,
+                False,
+                None,
+            )
+
         try:
-            sr, audio = model_holder.current_model.infer(
+            infer_kwargs = dict(
                 text=text,
                 language=language,
                 reference_audio_path=reference_audio_path,
@@ -323,12 +340,25 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
                 null_model_params=null_models,
                 force_reload_model=force_reload_model,
             )
+            if output_lab:
+                sr, audio, phone_durations = model_holder.current_model.infer(
+                    return_phone_durations=True,
+                    **infer_kwargs,
+                )
+            else:
+                sr, audio = model_holder.current_model.infer(**infer_kwargs)
         except InvalidToneError as e:
             logger.error(f"Tone error: {e}")
-            return f"Error: アクセント指定が不正です:\n{e}", None, kata_tone_json_str
+            return (
+                f"Error: アクセント指定が不正です:\n{e}",
+                None,
+                kata_tone_json_str,
+                False,
+                None,
+            )
         except ValueError as e:
             logger.error(f"Value error: {e}")
-            return f"Error: {e}", None, kata_tone_json_str
+            return f"Error: {e}", None, kata_tone_json_str, False, None
 
         end_time = datetime.datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -343,7 +373,21 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
         message = f"Success, time: {duration} seconds."
         if wrong_tone_message != "":
             message = wrong_tone_message + "\n" + message
-        return message, (sr, audio), kata_tone_json_str, False
+
+        lab_file_path: Optional[str] = None
+        if output_lab:
+            # gr.File に渡すため、一時ファイルとして書き出す。
+            # Gradio がこのファイルの寿命を管理するので、明示的な削除は不要。
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".lab",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp_f:
+                lab_file_path = tmp_f.name
+            write_lab_file(phone_durations, lab_file_path)
+
+        return message, (sr, audio), kata_tone_json_str, False, lab_file_path
 
     def get_model_files(model_name: str):
         return [str(f) for f in model_holder.model_files_dict[model_name]]
@@ -662,6 +706,11 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
                 ref_audio_path = gr.Audio(
                     label="参照音声", type="filepath", visible=False
                 )
+                output_lab = gr.Checkbox(
+                    label="LABファイルも出力する（音素タイミング, HTS/Julius形式）",
+                    value=False,
+                    info="音高・抑揚が1.0のときのみ利用できます。",
+                )
                 tts_button = gr.Button(
                     "音声合成（モデルをロードしてください）",
                     variant="primary",
@@ -669,6 +718,9 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
                 )
                 text_output = gr.Textbox(label="情報")
                 audio_output = gr.Audio(label="結果")
+                lab_output = gr.File(
+                    label="LABファイル（音素タイミング）", visible=True
+                )
                 with gr.Accordion("テキスト例", open=False):
                     gr.Examples(examples, inputs=[text_input, language])
 
@@ -698,8 +750,9 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
                 intonation_scale,
                 null_models,
                 force_reload_model,
+                output_lab,
             ],
-            outputs=[text_output, audio_output, tone, force_reload_model],
+            outputs=[text_output, audio_output, tone, force_reload_model, lab_output],
         )
 
         model_name.change(
