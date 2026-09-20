@@ -377,7 +377,11 @@ class TTSModel:
         intonation_scale: float = 1.0,
         null_model_params: Optional[dict[int, NullModelParam]] = None,
         force_reload_model: bool = False,
-    ) -> tuple[int, NDArray[Any]]:
+        return_phone_durations: bool = False,
+        phone_durations_blank_mode: str = "boundary_and_punctuation",
+        pause_label: str = "pau",
+        punctuation_as_pause: bool = True,
+    ) -> "tuple[int, NDArray[Any]] | tuple[int, NDArray[Any], list[tuple[str, int, int]]]":
         """
         テキストから音声を合成する。
 
@@ -403,8 +407,39 @@ class TTSModel:
             intonation_scale (float, optional): 抑揚の平均からの変化幅 (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
             null_model_params (Optional[dict[int, NullModelParam]], optional): 推論時に使用するヌルモデルの情報。ONNX 推論では無視される。
             force_reload_model (bool, optional): モデルを強制的に再ロードするかどうか. Defaults to False.
+            return_phone_durations (bool, optional): True の場合、音声データに加えて各音素の
+                開始・終了時刻（100ns単位、HTS/Julius式 .lab フォーマット準拠）のリストを返す。
+                PyTorch 推論のみ対応（ONNX モデルでは ValueError）。また pitch_scale/intonation_scale
+                を 1.0 以外にすると adjust_voice() で音声長が変化し時刻とズレるため、
+                その組み合わせも ValueError とする。line_split=True の場合は各行ごとの
+                時刻を split_interval の無音長で補正して結合する。 Defaults to False.
+            phone_durations_blank_mode (str, optional): return_phone_durations=True のとき、
+                pause 扱いとなる区間（PAD ラン、および句読点）の扱い方。add_blank=True
+                では VITS の仕様上すべての音素の前後に短い PAD が挿入されるため、
+                単純に「PAD=無音」として全部残すと音素間に大量の短い pau が
+                入ってしまう点に注意。
+                - "boundary_and_punctuation"（デフォルト）: 文頭・文末、および
+                  句読点（、。？！等）の位置を pause_label として残す。音素間の
+                  技術的な PAD（句読点を含まないもの）は左右の実音素へ吸収される。
+                  句読点による間を明示しつつ、音素間には無駄な pau が入らない、
+                  通常はこれを使う。
+                - "boundary_only": 文頭・文末の PAD のみ pause_label として残す。
+                  句読点も含め、文中の pause はすべて実音素側へ吸収される。
+                - "all": すべての pause 区間を pause_label 行として残す（音素間にも
+                  短い pau が大量に入る。デバッグ・検証用途向け）。
+                - "merge": すべての pause 区間を実音素側に吸収し、pau 行を一切出力しない
+                  （文頭・文末の無音もラベル上から消える）。
+            pause_label (str, optional): phone_durations_blank_mode で "merge" 以外を
+                選んだとき、pause 区間に付けるラベル文字列。 Defaults to "pau".
+            punctuation_as_pause (bool, optional): True（デフォルト）の場合、
+                句読点（、。？！等に対応するトークン）も PAD と同様に pause 扱いにし、
+                pause_label として出力する。False の場合、句読点はそのままの文字
+                （"," "." "?" 等）がラベルとして出力される。 Defaults to True.
         Returns:
             tuple[int, NDArray[Any]]: サンプリングレートと音声データ (16bit PCM)
+            return_phone_durations=True の場合は
+            tuple[int, NDArray[Any], list[tuple[str, int, int]]]
+            （音素ラベル, 開始100ns, 終了100ns のリストを追加で返す）
         """
 
         logger.info(f"Start generating audio data from text:\n{text}")
@@ -416,6 +451,20 @@ class TTSModel:
             reference_audio_path = None
         if assist_text == "" or not use_assist_text:
             assist_text = None
+
+        if return_phone_durations:
+            if self.is_onnx_model:
+                raise ValueError(
+                    "return_phone_durations=True is not supported for ONNX models "
+                    "(attn alignment path is not exposed by infer_onnx)."
+                )
+            if not (pitch_scale == 1.0 and intonation_scale == 1.0):
+                raise ValueError(
+                    "return_phone_durations=True cannot be combined with "
+                    "pitch_scale/intonation_scale != 1.0: adjust_voice() resamples "
+                    "the audio and the returned phone timings would no longer match "
+                    "the output waveform."
+                )
 
         # スタイルベクトルを取得
         if reference_audio_path is None:
@@ -448,9 +497,10 @@ class TTSModel:
             assert self.net_g is not None
 
             # 通常のテキストから音声を生成
+            phone_durations: Optional[list[tuple[str, int, int]]] = None
             if not line_split:
                 with torch.no_grad():
-                    audio = infer(
+                    infer_result = infer(
                         text=text,
                         sdp_ratio=sdp_ratio,
                         noise_scale=noise,
@@ -466,33 +516,70 @@ class TTSModel:
                         style_vec=style_vector,
                         given_phone=given_phone,
                         given_tone=given_tone,
+                        return_phone_durations=return_phone_durations,
+                        phone_durations_blank_mode=phone_durations_blank_mode,
+                        pause_label=pause_label,
+                        punctuation_as_pause=punctuation_as_pause,
                     )
+                if return_phone_durations:
+                    audio, phone_durations = infer_result  # type: ignore[misc]
+                else:
+                    audio = infer_result  # type: ignore[assignment]
 
             # 改行ごとに分割して音声を生成
             else:
                 texts = [t for t in text.split("\n") if t != ""]
                 audios = []
+                phone_durations = [] if return_phone_durations else None
+                # 100ns 単位でのオフセット。行間に split_interval 秒の無音が
+                # 挿入されるため、各行の音素時刻をこの分だけ後ろにずらして
+                # 結合後の音声全体と一致させる。
+                offset_100ns = 0
+                split_silence_100ns = round(split_interval * 1e7)
                 with torch.no_grad():
                     for i, t in enumerate(texts):
-                        audios.append(
-                            infer(
-                                text=t,
-                                sdp_ratio=sdp_ratio,
-                                noise_scale=noise,
-                                noise_scale_w=noise_w,
-                                length_scale=length,
-                                sid=speaker_id,
-                                language=language,
-                                hps=self.hyper_parameters,
-                                net_g=self.net_g,
-                                device=self.device,
-                                assist_text=assist_text,
-                                assist_text_weight=assist_text_weight,
-                                style_vec=style_vector,
-                            )
+                        infer_result = infer(
+                            text=t,
+                            sdp_ratio=sdp_ratio,
+                            noise_scale=noise,
+                            noise_scale_w=noise_w,
+                            length_scale=length,
+                            sid=speaker_id,
+                            language=language,
+                            hps=self.hyper_parameters,
+                            net_g=self.net_g,
+                            device=self.device,
+                            assist_text=assist_text,
+                            assist_text_weight=assist_text_weight,
+                            style_vec=style_vector,
+                            return_phone_durations=return_phone_durations,
+                            phone_durations_blank_mode=phone_durations_blank_mode,
+                            pause_label=pause_label,
+                            punctuation_as_pause=punctuation_as_pause,
                         )
+                        if return_phone_durations:
+                            line_audio, line_durations = infer_result  # type: ignore[misc]
+                            assert phone_durations is not None
+                            for label, start_100ns, end_100ns in line_durations:
+                                phone_durations.append(
+                                    (
+                                        label,
+                                        start_100ns + offset_100ns,
+                                        end_100ns + offset_100ns,
+                                    )
+                                )
+                            offset_100ns += round(
+                                len(line_audio)
+                                / self.hyper_parameters.data.sampling_rate
+                                * 1e7
+                            )
+                        else:
+                            line_audio = infer_result  # type: ignore[assignment]
+                        audios.append(line_audio)
                         if i != len(texts) - 1:
-                            audios.append(np.zeros(int(44100 * split_interval)))
+                            silence = np.zeros(int(44100 * split_interval))
+                            audios.append(silence)
+                            offset_100ns += split_silence_100ns
                     audio = np.concatenate(audios)
 
         # ONNX 推論時
@@ -566,6 +653,9 @@ class TTSModel:
                 intonation_scale=intonation_scale,
             )
         audio = self.convert_to_16_bit_wav(audio)
+        if return_phone_durations:
+            assert phone_durations is not None
+            return (self.hyper_parameters.data.sampling_rate, audio, phone_durations)
         return (self.hyper_parameters.data.sampling_rate, audio)
 
 
