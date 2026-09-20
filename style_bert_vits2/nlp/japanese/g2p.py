@@ -91,6 +91,42 @@ def g2p(
     return phones, tones, word2ph
 
 
+def get_unvoiced_vowel_flags(text: str) -> list[bool]:
+    """
+    テキストに対して、pyopenjtalk の解析結果に基づく「実音素ごとの無声化フラグ」の
+    リストを返す。g2p() が返す phones から特殊記号（"_" などの punctuation や
+    add_blank 由来の PAD）を取り除いた実音素列と、同じ順序・同じ長さになる
+    （句読点はここには含まれない。__g2phone_tone_wo_punct と同様、実音素のみを対象とする）。
+
+    実装上の注意: g2p() 内部で実際にモデルへ渡される音素文字自体は
+    __kata_to_phoneme_list（カタカナ読み由来）から来ており、
+    __pyopenjtalk_g2p_prosody(drop_unvoiced_vowels=True) はアクセント計算にしか
+    使われていない。そのため無声化フラグそのものは phones の文字列と直接
+    紐付いていないが、実音素が現れる順序は両者で一致するため、
+    drop_unvoiced_vowels=False で得た生の音素列（A/E/I/O/U が大文字のまま残る）
+    を順に走査し、大文字母音だったかどうかを True/False として並べることで
+    実音素列と位置対応するフラグ列を作れる。
+
+    Args:
+        text (str): 正規化されたテキスト（norm_text）
+
+    Returns:
+        list[bool]: 実音素ごとに無声化されていたかどうか（True=無声化）。
+            g2p() の phones から先頭・末尾の "_" を除いた実音素列と同じ長さ・順序。
+    """
+
+    raw_phones = __pyopenjtalk_g2p_prosody(text, drop_unvoiced_vowels=False)
+    flags: list[bool] = []
+    for letter in raw_phones:
+        if letter in ("^", "$", "?", "_", "#", "[", "]"):
+            continue
+        if letter == "cl":
+            letter = "q"
+        flags.append(letter in "AEIOU")
+
+    return flags
+
+
 def text_to_sep_kata(
     norm_text: str, raise_yomi_error: bool = False
 ) -> tuple[list[str], list[str]]:
